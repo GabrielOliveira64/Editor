@@ -20,8 +20,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Instalar Android SDK
-        uses: android-actions/setup-android@v3
+      # O servidor do GitHub já vem com o Android SDK instalado.
+      - name: Configurar Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "Android SDK em: $SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)
+          if [ -n "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+          fi
+          ls "$SDK/platforms" || true
 
       - name: Instalar Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -52,6 +63,7 @@ jobs:
           mkdir -p build_app/app/src/main/res/drawable
           cp "$SRC" build_app/app/src/main/java/com/colagem/shorts/MainActivity.kt
           cd build_app
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
