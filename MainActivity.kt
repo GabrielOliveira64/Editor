@@ -29,7 +29,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.text.InputType
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.view.WindowManager
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -93,6 +98,24 @@ class Layer {
     var zoom = 1f; var panX = 0f; var panY = 0f
     var border = 0f
     var borderColor = Color.WHITE
+    // ---- Texto ----
+    var isText = false
+    var text = ""
+    var font = "sans-serif-black"
+    var textSize = 80f
+    var textColor = Color.WHITE
+    var bold = false
+    var italic = false
+    var align = 1                 // 0 = esquerda, 1 = centro, 2 = direita
+    var letterSp = 0f
+    var lineH = 1f
+    var textBg = Color.TRANSPARENT
+    var textPad = 0f
+    var outline = 0f
+    var outlineColor = Color.BLACK
+    var shBlur = 0f
+    var shDist = 0f
+    var shColor = 0xB3000000.toInt()
 
     fun cx() = x + w / 2f
     fun cy() = y + h / 2f
@@ -108,6 +131,13 @@ class Layer {
         o.put("cr", cropR.toDouble()); o.put("cb", cropB.toDouble())
         o.put("z", zoom.toDouble()); o.put("px", panX.toDouble()); o.put("py", panY.toDouble())
         o.put("bd", (border * sx).toDouble()); o.put("bc", borderColor)
+        if (isText) {
+            o.put("it", true); o.put("tx", text); o.put("tf", font); o.put("ts", (textSize * sx).toDouble())
+            o.put("tc", textColor); o.put("tbo", bold); o.put("tit", italic); o.put("tal", align)
+            o.put("tls", letterSp.toDouble()); o.put("tlh", lineH.toDouble()); o.put("tb", textBg)
+            o.put("tp", (textPad * sx).toDouble()); o.put("tow", (outline * sx).toDouble()); o.put("toc", outlineColor)
+            o.put("shb", (shBlur * sx).toDouble()); o.put("shd", (shDist * sx).toDouble()); o.put("shc", shColor)
+        }
         return o
     }
 
@@ -135,6 +165,25 @@ class Layer {
             l.panX = o.optDouble("px", 0.0).toFloat(); l.panY = o.optDouble("py", 0.0).toFloat()
             l.border = o.optDouble("bd", 0.0).toFloat() * sx
             l.borderColor = o.optInt("bc", Color.WHITE)
+            l.isText = o.optBoolean("it", false)
+            if (l.isText) {
+                l.text = o.optString("tx", "")
+                l.font = o.optString("tf", "sans-serif-black")
+                l.textSize = max(1f, o.optDouble("ts", 80.0).toFloat() * sx)
+                l.textColor = o.optInt("tc", Color.WHITE)
+                l.bold = o.optBoolean("tbo", false)
+                l.italic = o.optBoolean("tit", false)
+                l.align = o.optInt("tal", 1)
+                l.letterSp = o.optDouble("tls", 0.0).toFloat()
+                l.lineH = o.optDouble("tlh", 1.0).toFloat()
+                l.textBg = o.optInt("tb", Color.TRANSPARENT)
+                l.textPad = o.optDouble("tp", 0.0).toFloat() * sx
+                l.outline = o.optDouble("tow", 0.0).toFloat() * sx
+                l.outlineColor = o.optInt("toc", Color.BLACK)
+                l.shBlur = o.optDouble("shb", 0.0).toFloat() * sx
+                l.shDist = o.optDouble("shd", 0.0).toFloat() * sx
+                l.shColor = o.optInt("shc", 0xB3000000.toInt())
+            }
             return l
         }
     }
@@ -219,6 +268,37 @@ val TEMPLATES = listOf(
     Template("1 + 2 lateral", listOf(cell(0f, 0f, 0.6f, 1f), cell(0.6f, 0f, 1f, 0.5f), cell(0.6f, 0.5f, 1f, 1f))),
     Template("Moldura central", listOf(cell(0.06f, 0.2f, 0.94f, 0.8f)))
 )
+
+// ------------------------------ Fontes -------------------------------
+val FONTS = listOf(
+    "sans-serif" to "Padrão", "sans-serif-medium" to "Média", "sans-serif-black" to "Black",
+    "sans-serif-light" to "Leve", "sans-serif-thin" to "Fina", "sans-serif-condensed" to "Condensada",
+    "serif" to "Serifada", "monospace" to "Mono", "serif-monospace" to "Máquina",
+    "casual" to "Casual", "cursive" to "Cursiva", "sans-serif-smallcaps" to "Versalete"
+)
+
+object Fonts {
+    private val cache = HashMap<String, Typeface>()
+
+    fun get(font: String, bold: Boolean, italic: Boolean): Typeface {
+        val st = if (bold && italic) Typeface.BOLD_ITALIC else if (bold) Typeface.BOLD
+        else if (italic) Typeface.ITALIC else Typeface.NORMAL
+        val key = "$font|$st"
+        synchronized(this) {
+            val c = cache[key]
+            if (c != null) return c
+        }
+        val base: Typeface = try {
+            if (font.startsWith("file:")) {
+                val f = File(font.removePrefix("file:"))
+                if (f.exists()) Typeface.createFromFile(f) else Typeface.DEFAULT
+            } else Typeface.create(font, Typeface.NORMAL)
+        } catch (t: Throwable) { Typeface.DEFAULT }
+        val tf = if (st == Typeface.NORMAL) base else Typeface.create(base, st)
+        synchronized(this) { cache[key] = tf }
+        return tf
+    }
+}
 
 // ------------------------- Imagens (cache) ---------------------------
 fun exifOrientation(ctx: Context, uri: Uri): Int {
@@ -495,7 +575,78 @@ class Renderer {
         bmpPaint.shader = null
     }
 
+    private val textBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val layerRect = RectF()
+
+    fun buildTextLayout(l: Layer): StaticLayout {
+        val tp = TextPaint(Paint.ANTI_ALIAS_FLAG)
+        tp.typeface = Fonts.get(l.font, l.bold, l.italic)
+        tp.textSize = max(1f, l.textSize)
+        tp.color = l.textColor
+        tp.letterSpacing = l.letterSp
+        val s: CharSequence = if (l.text.isEmpty()) " " else l.text
+        val innerW = max(1, (l.w - 2f * l.textPad).roundToInt())
+        val al = when (l.align) {
+            0 -> Layout.Alignment.ALIGN_NORMAL
+            2 -> Layout.Alignment.ALIGN_OPPOSITE
+            else -> Layout.Alignment.ALIGN_CENTER
+        }
+        return StaticLayout.Builder.obtain(s, 0, s.length, tp, innerW)
+            .setAlignment(al)
+            .setLineSpacing(0f, max(0.5f, l.lineH))
+            .setIncludePad(true)
+            .build()
+    }
+
+    fun drawText(c: Canvas, l: Layer) {
+        val lay = buildTextLayout(l)
+        l.h = lay.height + 2f * l.textPad
+        val tp = lay.paint
+        c.save()
+        c.translate(l.cx(), l.cy())
+        c.rotate(l.rot)
+        if (l.flipH) c.scale(-1f, 1f)
+        val a = l.opacity.coerceIn(0, 100) * 255 / 100
+        val ext = l.shBlur * 2f + l.shDist + l.outline * 2f + 4f
+        layerRect.set(-l.w / 2f - ext, -l.h / 2f - ext, l.w / 2f + ext, l.h / 2f + ext)
+        val layered = a < 255
+        if (layered) c.saveLayerAlpha(layerRect, a)
+        rDst.set(-l.w / 2f, -l.h / 2f, l.w / 2f, l.h / 2f)
+        val r = min(max(0f, l.radius), min(l.w, l.h) / 2f)
+        if (Color.alpha(l.textBg) > 0) {
+            textBgPaint.style = Paint.Style.FILL
+            textBgPaint.color = l.textBg
+            c.drawRoundRect(rDst, r, r, textBgPaint)
+        }
+        if (l.border > 0f) {
+            stroke.color = l.borderColor
+            stroke.strokeWidth = l.border
+            val hb = l.border / 2f
+            rTmp.set(rDst.left + hb, rDst.top + hb, rDst.right - hb, rDst.bottom - hb)
+            val rr = max(0f, r - hb)
+            c.drawRoundRect(rTmp, rr, rr, stroke)
+        }
+        c.translate(-l.w / 2f + l.textPad, -l.h / 2f + l.textPad)
+        val hasShadow = Color.alpha(l.shColor) > 0 && (l.shBlur > 0f || l.shDist > 0f)
+        val off = l.shDist * 0.7071f
+        if (hasShadow) tp.setShadowLayer(max(0.5f, l.shBlur), off, off, l.shColor) else tp.clearShadowLayer()
+        if (l.outline > 0f) {
+            tp.style = Paint.Style.STROKE
+            tp.strokeWidth = l.outline * 2f
+            tp.strokeJoin = Paint.Join.ROUND
+            tp.color = l.outlineColor
+            lay.draw(c)
+            tp.clearShadowLayer()
+            tp.style = Paint.Style.FILL
+            tp.color = l.textColor
+        }
+        lay.draw(c)
+        if (layered) c.restore()
+        c.restore()
+    }
+
     fun drawLayer(c: Canvas, l: Layer, export: Boolean, sync: Boolean, ui: Float) {
+        if (l.isText) { drawText(c, l); return }
         val src = l.src
         val b = if (src == null) null else if (sync) Images.loadSync(src) else Images.get(src)
         c.save()
@@ -563,6 +714,17 @@ class CollageView(private val act: MainActivity) : View(act) {
     private val checker = Paint()
     private val p = PointF()
     private val path = Path()
+    private val guidePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val gridPaint = Paint()
+    private val gridShadow = Paint()
+    private val guideX = ArrayList<Float>()
+    private val guideY = ArrayList<Float>()
+    private val candX = ArrayList<Float>()
+    private val candY = ArrayList<Float>()
+    private val tmpB = RectF()
+    private var sTs = 0f
+    private var lastTextTap = 0L
+    private var lastTextTapId = 0L
 
     private enum class Mode { NONE, MOVE, RESIZE, ROTATE, PINCH, PAN_CONTENT, PINCH_CONTENT, VIEW_PAN, VIEW_PINCH }
 
@@ -587,6 +749,12 @@ class CollageView(private val act: MainActivity) : View(act) {
         hText.color = C_ACCENT; hText.textAlign = Paint.Align.CENTER; hText.textSize = 13f * dens; hText.isFakeBoldText = true
         borderPaint.style = Paint.Style.STROKE; borderPaint.color = 0x66FFFFFF; borderPaint.strokeWidth = 1f
         checker.shader = makeChecker(dens)
+        guidePaint.color = 0xFFFF2D95.toInt()
+        guidePaint.strokeWidth = 1.5f * dens
+        gridPaint.color = 0x99FFFFFF.toInt()
+        gridPaint.strokeWidth = 1f
+        gridShadow.color = 0x66000000
+        gridShadow.strokeWidth = 1f
     }
 
     fun fit() {
@@ -642,6 +810,23 @@ class CollageView(private val act: MainActivity) : View(act) {
         c.restore()
         c.drawRect(left, top, right, bottom, borderPaint)
 
+        if (act.gridOn) {
+            val cols = act.gridCols
+            val rows = act.gridRows()
+            for (i in 1 until cols) {
+                val x = left + (right - left) * i / cols
+                c.drawLine(x + 1f, top, x + 1f, bottom, gridShadow)
+                c.drawLine(x, top, x, bottom, gridPaint)
+            }
+            for (j in 1 until rows) {
+                val y = top + (bottom - top) * j / rows
+                c.drawLine(left, y + 1f, right, y + 1f, gridShadow)
+                c.drawLine(left, y, right, y, gridPaint)
+            }
+        }
+        for (gx in guideX) { val x = toSX(gx); c.drawLine(x, 0f, x, height.toFloat(), guidePaint) }
+        for (gy in guideY) { val y = toSY(gy); c.drawLine(0f, y, width.toFloat(), y, guidePaint) }
+
         val l = act.selected() ?: return
         path.reset()
         layerPoint(l, -l.w / 2f, -l.h / 2f, p); path.moveTo(toSX(p.x), toSY(p.y))
@@ -680,6 +865,56 @@ class CollageView(private val act: MainActivity) : View(act) {
         if (l == null) return
         sX = l.x; sY = l.y; sW = l.w; sH = l.h; sRot = l.rot
         sZoom = l.zoom; sPanX = l.panX; sPanY = l.panY
+        sTs = l.textSize
+    }
+
+    // ------------- Linhas automáticas (snap) -------------
+    private fun prepareSnap(d: Doc, moving: Layer) {
+        candX.clear(); candY.clear()
+        val w = d.w.toFloat()
+        val h = d.h.toFloat()
+        candX.add(0f); candX.add(w / 2f); candX.add(w)
+        candY.add(0f); candY.add(h / 2f); candY.add(h)
+        if (act.gridOn) {
+            val cols = act.gridCols
+            val rows = act.gridRows()
+            for (i in 1 until cols) candX.add(w * i / cols)
+            for (j in 1 until rows) candY.add(h * j / rows)
+        }
+        for (o in d.layers) {
+            if (o === moving || !o.visible) continue
+            layerBounds(o, tmpB)
+            candX.add(tmpB.left); candX.add(tmpB.centerX()); candX.add(tmpB.right)
+            candY.add(tmpB.top); candY.add(tmpB.centerY()); candY.add(tmpB.bottom)
+        }
+    }
+
+    private fun bestSnap(vals: FloatArray, cands: List<Float>, thr: Float): Float? {
+        var best: Float? = null
+        var bestAbs = thr
+        for (v in vals) for (c in cands) {
+            val dd = c - v
+            if (abs(dd) <= bestAbs) { bestAbs = abs(dd); best = dd }
+        }
+        return best
+    }
+
+    private fun applySnap(l: Layer) {
+        guideX.clear(); guideY.clear()
+        val thr = 8f * dens / vs
+        layerBounds(l, tmpB)
+        val dx = bestSnap(floatArrayOf(tmpB.left, tmpB.centerX(), tmpB.right), candX, thr)
+        val dy = bestSnap(floatArrayOf(tmpB.top, tmpB.centerY(), tmpB.bottom), candY, thr)
+        if (dx != null) l.x += dx
+        if (dy != null) l.y += dy
+        layerBounds(l, tmpB)
+        val eps = 0.5f
+        if (dx != null) for (c in candX) {
+            if (abs(c - tmpB.left) < eps || abs(c - tmpB.centerX()) < eps || abs(c - tmpB.right) < eps) guideX.add(c)
+        }
+        if (dy != null) for (c in candY) {
+            if (abs(c - tmpB.top) < eps || abs(c - tmpB.centerY()) < eps || abs(c - tmpB.bottom) < eps) guideY.add(c)
+        }
     }
 
     private fun begin() {
@@ -712,12 +947,18 @@ class CollageView(private val act: MainActivity) : View(act) {
                         mode = Mode.VIEW_PAN
                     }
                 }
+                guideX.clear(); guideY.clear()
+                if (mode == Mode.MOVE && act.snapLines) {
+                    val ml = act.selected()
+                    if (ml != null) prepareSnap(d, ml)
+                }
                 snapStart(act.selected())
                 sVs = vs; sVx = vx; sVy = vy
                 invalidate()
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 if (e.pointerCount == 2) {
+                    guideX.clear(); guideY.clear()
                     val cur = act.selected()
                     sDist = max(1f, dist(e)); sAng = ang(e)
                     sMidX = (e.getX(0) + e.getX(1)) / 2f
@@ -739,6 +980,7 @@ class CollageView(private val act: MainActivity) : View(act) {
                         begin()
                         l.x = sX + (e.x - downX) / vs
                         l.y = sY + (e.y - downY) / vs
+                        if (act.snapLines) applySnap(l)
                     }
                     Mode.RESIZE -> if (l != null) { begin(); resize(l, e) }
                     Mode.ROTATE -> if (l != null) { begin(); rotate(l, e) }
@@ -746,6 +988,7 @@ class CollageView(private val act: MainActivity) : View(act) {
                         begin()
                         val s = dist(e) / sDist
                         l.w = max(8f, sW * s); l.h = max(8f, sH * s)
+                        if (l.isText) l.textSize = max(4f, sTs * s)
                         l.rot = normAngle(sRot + ang(e) - sAng)
                         val ncx = sX + sW / 2f + ((e.getX(0) + e.getX(1)) / 2f - sMidX) / vs
                         val ncy = sY + sH / 2f + ((e.getY(0) + e.getY(1)) / 2f - sMidY) / vs
@@ -783,6 +1026,16 @@ class CollageView(private val act: MainActivity) : View(act) {
                     val t = tapLayer
                     if (t != null) {
                         if (t.isFrame && !t.locked && (t.src == null || Images.isMissing(t.src))) act.pickFill(t.id)
+                        else if (t.isText && !t.locked) {
+                            val now = SystemClock.uptimeMillis()
+                            if (now - lastTextTap < 400 && lastTextTapId == t.id) {
+                                act.editText(t.id)
+                                lastTextTap = 0L
+                            } else {
+                                lastTextTap = now
+                                lastTextTapId = t.id
+                            }
+                        }
                     } else if (mode == Mode.VIEW_PAN) {
                         val now = SystemClock.uptimeMillis()
                         if (now - lastTap < 350) fit()
@@ -791,6 +1044,8 @@ class CollageView(private val act: MainActivity) : View(act) {
                 }
                 mode = Mode.NONE
                 changed = false
+                guideX.clear(); guideY.clear()
+                invalidate()
             }
         }
         return true
@@ -806,11 +1061,12 @@ class CollageView(private val act: MainActivity) : View(act) {
         val ldy = -dx * s + dy * c
         var nw = sW + ldx
         var nh = sH + ldy
-        if (act.keepAspect) {
+        if (act.keepAspect || l.isText) {
             val k = ((sW + ldx) * sW + (sH + ldy) * sH) / (sW * sW + sH * sH)
             nw = sW * k; nh = sH * k
         }
         nw = max(8f, nw); nh = max(8f, nh)
+        if (l.isText) l.textSize = max(4f, sTs * nw / sW)
         val hw = (nw - sW) / 2f
         val hh = (nh - sH) / 2f
         val cx = sX + sW / 2f + hw * c - hh * s
@@ -885,12 +1141,27 @@ class MainActivity : Activity() {
         const val REQ_FILL = 12
         const val REQ_BG = 13
         const val REQ_EXPORT = 14
+        const val REQ_FONT = 15
     }
 
     var doc: Doc? = null
     var selectedId = 0L
     var keepAspect = true
     var contentMode = false
+    var snapLines = true
+    var gridOn = false
+    var gridCols = 4
+
+    fun gridRows(): Int {
+        val d = doc ?: return gridCols
+        return max(1, (gridCols * d.h / d.w.toFloat()).roundToInt())
+    }
+
+    private fun prefs() = getSharedPreferences("config", MODE_PRIVATE)
+
+    private fun savePrefs() {
+        prefs().edit().putBoolean("snap", snapLines).putBoolean("grid", gridOn).putInt("cols", gridCols).apply()
+    }
 
     private var screen = "home"
     private lateinit var canvasView: CollageView
@@ -931,6 +1202,10 @@ class MainActivity : Activity() {
         Images.app = applicationContext
         window.statusBarColor = C_PANEL
         window.navigationBarColor = C_PANEL
+        val p = prefs()
+        snapLines = p.getBoolean("snap", true)
+        gridOn = p.getBoolean("grid", false)
+        gridCols = p.getInt("cols", 4).coerceIn(2, 12)
         showHome()
     }
 
@@ -1086,9 +1361,10 @@ class MainActivity : Activity() {
     }
 
     private fun swatches(current: Int, withTransparent: Boolean, onPick: (Int) -> Unit): View {
-        val colors = ArrayList<Int>()
+        val colors = ArrayList<Int?>()
         if (withTransparent) colors.add(Color.TRANSPARENT)
         for (c in palette) colors.add(c)
+        colors.add(null) // null = cor personalizada
         val perRow = 9
         val box = vbox()
         var row = LinearLayout(this)
@@ -1097,12 +1373,22 @@ class MainActivity : Activity() {
                 row = LinearLayout(this)
                 box.addView(row)
             }
-            val v = tv(if (c == Color.TRANSPARENT) "∅" else "", 14f, C_TEXT)
-            v.gravity = Gravity.CENTER
-            val sel = c == current
-            v.background = rounded(if (c == Color.TRANSPARENT) C_BTN else c, 6,
-                if (sel) C_ACCENT else 0x55FFFFFF, if (sel) 3 else 1)
-            v.setOnClickListener { onPick(c) }
+            val v: TextView
+            if (c == null) {
+                v = tv("🎨", 14f, C_TEXT)
+                v.gravity = Gravity.CENTER
+                val custom = palette.none { it == current } && current != Color.TRANSPARENT
+                v.background = rounded(if (custom) current else C_BTN, 6,
+                    if (custom) C_ACCENT else 0x55FFFFFF, if (custom) 3 else 1)
+                v.setOnClickListener { colorPicker(current, onPick) }
+            } else {
+                v = tv(if (c == Color.TRANSPARENT) "∅" else "", 14f, C_TEXT)
+                v.gravity = Gravity.CENTER
+                val sel = c == current
+                v.background = rounded(if (c == Color.TRANSPARENT) C_BTN else c, 6,
+                    if (sel) C_ACCENT else 0x55FFFFFF, if (sel) 3 else 1)
+                v.setOnClickListener { onPick(c) }
+            }
             val p = LinearLayout.LayoutParams(0, dp(32), 1f)
             p.setMargins(dp(2), dp(2), dp(2), dp(2))
             row.addView(v, p)
@@ -1402,27 +1688,33 @@ class MainActivity : Activity() {
         root.addView(panelScroll, LinearLayout.LayoutParams(MATCH, (resources.displayMetrics.heightPixels * 0.42f).toInt()))
 
         // Abas (menu estilo Photoshop)
+        val tabScroll = HorizontalScrollView(this)
+        tabScroll.isHorizontalScrollBarEnabled = false
+        tabScroll.setBackgroundColor(C_PANEL)
         val tabs = LinearLayout(this)
         tabs.orientation = LinearLayout.HORIZONTAL
-        tabs.setBackgroundColor(C_PANEL)
         tabs.setPadding(dp(4), dp(4), dp(4), dp(6))
         tabViews.clear()
         val items = listOf(
             "import" to "📥\nImportar", "layers" to "🗂\nCamadas", "props" to "🎛\nAjustes",
+            "text" to "🔤\nTexto", "align" to "📐\nAlinhamento",
             "styles" to "🧩\nEstilos", "bg" to "🎨\nFundo"
         )
+        val tabW = max(dp(70), (resources.displayMetrics.widthPixels - dp(8)) / items.size - dp(4))
         for ((key, label) in items) {
-            val t = tv(label, 11f, C_TEXT)
+            val t = tv(label, 10.5f, C_TEXT)
             t.gravity = Gravity.CENTER
+            t.maxLines = 2
             t.setPadding(0, dp(6), 0, dp(6))
             t.background = rounded(C_PANEL, 8)
             t.setOnClickListener { setTab(key) }
             tabViews[key] = t
-            val p = LinearLayout.LayoutParams(0, WRAP, 1f)
+            val p = LinearLayout.LayoutParams(tabW, WRAP)
             p.setMargins(dp(2), 0, dp(2), 0)
             tabs.addView(t, p)
         }
-        root.addView(tabs)
+        tabScroll.addView(tabs)
+        root.addView(tabScroll)
         setContentView(root)
 
         Images.listener = {
@@ -1457,6 +1749,8 @@ class MainActivity : Activity() {
         when (tab) {
             "layers" -> buildLayers()
             "props" -> buildProps()
+            "text" -> buildText()
+            "align" -> buildAlign()
             "styles" -> buildStyles()
             "bg" -> buildBg()
         }
@@ -1473,7 +1767,7 @@ class MainActivity : Activity() {
         selectedId = id
         if (screen == "editor") {
             canvasView.invalidate()
-            if (tab == "props" || tab == "layers") refreshPanel()
+            if (tab == "props" || tab == "layers" || tab == "text" || tab == "align") refreshPanel()
         }
     }
 
@@ -1491,7 +1785,7 @@ class MainActivity : Activity() {
 
     fun onLayerChanged() {
         dirty()
-        if (tab == "props" || tab == "layers") refreshPanel()
+        if (tab == "props" || tab == "layers" || tab == "text") refreshPanel()
     }
 
     private fun commit() {
@@ -1560,6 +1854,11 @@ class MainActivity : Activity() {
         if (requestCode == REQ_EXPORT) {
             val u = data.data
             if (u != null) doExport(u)
+            return
+        }
+        if (requestCode == REQ_FONT) {
+            val u = data.data
+            if (u != null) importFont(u)
             return
         }
         val uris = ArrayList<Uri>()
@@ -1715,12 +2014,14 @@ class MainActivity : Activity() {
             panel.addView(tv("Toque numa imagem ou forma no canvas (ou escolha em 🗂 Camadas) para ver as opções.", 13f, C_DIM))
             return
         }
-        panel.addView(tv(l.name + "  •  " + (if (l.isFrame) "Forma (moldura)" else "Imagem"), 15f, C_TEXT, true))
+        val kind = if (l.isText) "Texto" else if (l.isFrame) "Forma (moldura)" else "Imagem"
+        panel.addView(tv(l.name + "  •  " + kind, 15f, C_TEXT, true))
         if (l.locked) {
             panel.addView(tv("🔒 Esta camada está bloqueada.", 13f, C_DIM))
             panel.addView(hrow(btn("🔓 Desbloquear", C_ACCENT) { pushUndo(); l.locked = false; commit() }))
             return
         }
+        if (l.isText) { buildTextProps(l); return }
 
         panel.addView(section("POSIÇÃO E TAMANHO (px)"))
         val ex = numField(l.x)
@@ -1956,7 +2257,8 @@ class MainActivity : Activity() {
             if (bm != null) iv.setImageBitmap(bm)
             r.addView(iv, LinearLayout.LayoutParams(dp(40), dp(40)))
             val warn = if (l.src != null && Images.isMissing(l.src)) "  ⚠" else ""
-            val name = tv((if (l.isFrame) "▢ " else "🖼 ") + l.name + warn, 13f, if (l.visible) C_TEXT else C_DIM)
+            val icon = if (l.isText) "🔤 " else if (l.isFrame) "▢ " else "🖼 "
+            val name = tv(icon + l.name + warn, 13f, if (l.visible) C_TEXT else C_DIM)
             name.setPadding(dp(10), 0, dp(4), 0)
             name.maxLines = 1
             r.addView(name, LinearLayout.LayoutParams(0, WRAP, 1f))
@@ -2071,6 +2373,356 @@ class MainActivity : Activity() {
         selectedId = n.id
         commit()
         toast("Camadas fundidas")
+    }
+
+    // ========================== PAINEL: TEXTO ========================
+    private fun textName(s: String) = "Texto: " + s.replace('\n', ' ').trim().take(18)
+
+    fun editText(id: Long) = editTextDialog(id)
+
+    private fun editTextDialog(id: Long?) {
+        val d = doc ?: return
+        val l = if (id == null) null else d.find(id)
+        val e = EditText(this)
+        e.setText(l?.text ?: "")
+        e.hint = "Digite o texto"
+        e.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        e.minLines = 2
+        e.maxLines = 6
+        e.setTextColor(C_TEXT)
+        e.setSelection(e.text.length)
+        val box = FrameLayout(this)
+        box.setPadding(dp(20), dp(8), dp(20), 0)
+        box.addView(e)
+        val dlg = AlertDialog.Builder(this).setTitle(if (l == null) "Novo texto" else "Editar texto").setView(box)
+            .setPositiveButton("OK") { _, _ ->
+                val s = e.text.toString()
+                if (s.isBlank()) return@setPositiveButton
+                pushUndo()
+                if (l == null) addTextLayer(s)
+                else {
+                    l.text = s
+                    if (l.name.startsWith("Texto")) l.name = textName(s)
+                }
+                commit()
+            }
+            .setNegativeButton("Cancelar", null).create()
+        dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        dlg.show()
+        e.requestFocus()
+    }
+
+    private fun addTextLayer(s: String) {
+        val d = doc ?: return
+        val l = Layer()
+        l.id = newId()
+        l.isText = true
+        l.text = s
+        l.name = textName(s)
+        l.textSize = d.w * 0.075f
+        l.w = d.w * 0.84f
+        l.h = l.textSize * 1.4f
+        l.x = (d.w - l.w) / 2f
+        l.y = (d.h - l.h) / 2f
+        l.font = "sans-serif-black"
+        l.align = 1
+        l.textColor = Color.WHITE
+        l.textPad = d.w * 0.02f
+        l.shBlur = d.w * 0.006f
+        l.shDist = d.w * 0.003f
+        l.shColor = 0xB3000000.toInt()
+        d.layers.add(l)
+        selectedId = l.id
+        if (tab != "text") setTab("text")
+    }
+
+    private fun toggleBtn(label: String, on: Boolean, onClick: () -> Unit) =
+        btn(label, if (on) C_ACCENT else C_BTN, onClick)
+
+    private fun fontDir(): File {
+        val f = File(filesDir, "fonts")
+        f.mkdirs()
+        return f
+    }
+
+    private fun pickFont() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        i.type = "*/*"
+        try { startActivityForResult(i, REQ_FONT) } catch (e: Exception) { toast("Seletor de arquivos indisponível") }
+    }
+
+    private fun importFont(u: Uri) {
+        var name = "fonte_" + System.currentTimeMillis() + ".ttf"
+        try {
+            contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val n = c.getString(0)
+                    if (!n.isNullOrBlank()) name = n
+                }
+            }
+        } catch (e: Exception) { }
+        val lower = name.lowercase(Locale.ROOT)
+        if (!lower.endsWith(".ttf") && !lower.endsWith(".otf")) {
+            toast("Escolha um arquivo de fonte .ttf ou .otf")
+            return
+        }
+        val f = File(fontDir(), name.replace(Regex("[^A-Za-z0-9._ -]"), "_"))
+        try {
+            val ins = contentResolver.openInputStream(u) ?: throw Exception("sem acesso")
+            ins.use { input -> f.outputStream().use { input.copyTo(it) } }
+            Typeface.createFromFile(f)
+        } catch (t: Throwable) {
+            f.delete()
+            toast("Não foi possível usar essa fonte")
+            return
+        }
+        val l = selected()
+        if (l != null && l.isText) { pushUndo(); l.font = "file:" + f.absolutePath }
+        toast("Fonte importada")
+        commit()
+    }
+
+    private fun radiusSlider(l: Layer, label: String): View {
+        val minHalf = min(l.w, l.h) / 2f
+        val pct = if (minHalf > 0f) (l.radius / minHalf * 100f).roundToInt().coerceIn(0, 100) else 0
+        return slider(label, 0, 100, pct, "%") { v -> l.radius = v / 100f * min(l.w, l.h) / 2f }
+    }
+
+    private fun buildTextProps(l: Layer) {
+        val d = doc ?: return
+        panel.addView(section("POSIÇÃO E LARGURA DA CAIXA (px)"))
+        val ex = numField(l.x)
+        val ey = numField(l.y)
+        val ew = numField(l.w)
+        panel.addView(hrow(labeled("X", ex), labeled("Y", ey), labeled("Largura", ew)))
+        panel.addView(tv("A altura se ajusta sozinha ao texto.", 11f, C_DIM))
+        panel.addView(hrow(
+            btn("Aplicar", C_ACCENT) {
+                pushUndo()
+                l.x = ex.num(l.x); l.y = ey.num(l.y); l.w = max(20f, ew.num(l.w))
+                commit()
+            },
+            btn("Centralizar") { pushUndo(); l.x = (d.w - l.w) / 2f; l.y = (d.h - l.h) / 2f; commit() }
+        ))
+        panel.addView(section("APARÊNCIA"))
+        panel.addView(slider("Rotação", -180, 180, l.rot.roundToInt(), "°") { v -> l.rot = v.toFloat() })
+        panel.addView(slider("Opacidade", 0, 100, l.opacity, "%") { v -> l.opacity = v })
+        panel.addView(btn("🔤 Fonte, cor, sombra e mais…", C_ACCENT) { setTab("text") }, lp(MATCH, WRAP, 0f, dp(8)))
+        panel.addView(section("CAMADA"))
+        panel.addView(hrow(
+            btn("⧉ Duplicar") { duplicate(l) },
+            btn("🔒 Bloquear") { pushUndo(); l.locked = true; commit() },
+            btn("🗑 Excluir", C_DANGER) { deleteLayer(l) }
+        ))
+    }
+
+    private fun buildText() {
+        val d = doc ?: return
+        panel.addView(btn("+ Adicionar texto", C_ACCENT) { editTextDialog(null) }, lp(MATCH, WRAP))
+        val l = selected()
+        if (l == null || !l.isText) {
+            val t = tv("Selecione um texto no canvas para ver as opções. Toque duas vezes num texto para mudar o que está escrito.", 12f, C_DIM)
+            t.setPadding(dp(4), dp(10), dp(4), 0)
+            panel.addView(t)
+            return
+        }
+        if (l.locked) {
+            panel.addView(tv("🔒 Este texto está bloqueado.", 13f, C_DIM))
+            panel.addView(hrow(btn("🔓 Desbloquear", C_ACCENT) { pushUndo(); l.locked = false; commit() }))
+            return
+        }
+        panel.addView(section("TEXTO SELECIONADO"))
+        val prev = tv("“" + l.text + "”", 14f, C_TEXT)
+        prev.maxLines = 3
+        panel.addView(prev)
+        panel.addView(hrow(
+            btn("✏ Editar texto") { editTextDialog(l.id) },
+            btn("⧉ Duplicar") { duplicate(l) },
+            btn("🗑 Excluir", C_DANGER) { deleteLayer(l) }
+        ))
+
+        // Fontes
+        panel.addView(section("FONTE"))
+        val hs = HorizontalScrollView(this)
+        val strip = LinearLayout(this)
+        hs.addView(strip)
+        val fonts = ArrayList<Pair<String, String>>(FONTS)
+        val files = fontDir().listFiles()?.sortedBy { it.name } ?: emptyList()
+        for (f in files) fonts.add(Pair("file:" + f.absolutePath, f.nameWithoutExtension))
+        for ((key, name) in fonts) {
+            val chip = vbox()
+            chip.gravity = Gravity.CENTER
+            chip.setPadding(dp(6), dp(6), dp(6), dp(6))
+            val sel = key == l.font
+            chip.background = rounded(if (sel) C_ACCENT_DARK else C_BTN, 8, if (sel) C_ACCENT else 0, 2)
+            val aa = tv("Aa", 22f, C_TEXT)
+            aa.typeface = Fonts.get(key, false, false)
+            aa.gravity = Gravity.CENTER
+            val nm = tv(name, 10f, C_DIM)
+            nm.gravity = Gravity.CENTER
+            nm.maxLines = 1
+            chip.addView(aa)
+            chip.addView(nm)
+            chip.setOnClickListener { pushUndo(); l.font = key; commit() }
+            if (key.startsWith("file:")) chip.setOnLongClickListener {
+                confirmDialog("Remover a fonte \"$name\" do app?") { File(key.removePrefix("file:")).delete(); refreshPanel() }
+                true
+            }
+            val p = LinearLayout.LayoutParams(dp(78), WRAP)
+            p.rightMargin = dp(6)
+            strip.addView(chip, p)
+        }
+        strip.addView(btn("+ Importar\nfonte") { pickFont() }, LinearLayout.LayoutParams(dp(84), MATCH))
+        panel.addView(hs)
+        panel.addView(tv("Importe fontes .ttf/.otf baixadas da internet. Segure uma fonte importada para remover.", 11f, C_DIM))
+        panel.addView(hrow(
+            toggleBtn("B  Negrito", l.bold) { pushUndo(); l.bold = !l.bold; commit() },
+            toggleBtn("I  Itálico", l.italic) { pushUndo(); l.italic = !l.italic; commit() }
+        ))
+        panel.addView(hrow(
+            toggleBtn("⬅ Esquerda", l.align == 0) { pushUndo(); l.align = 0; commit() },
+            toggleBtn("↔ Centro", l.align == 1) { pushUndo(); l.align = 1; commit() },
+            toggleBtn("➡ Direita", l.align == 2) { pushUndo(); l.align = 2; commit() }
+        ))
+
+        // Tamanho
+        panel.addView(section("TAMANHO E ESPAÇAMENTO"))
+        val maxTs = max(300, d.w / 2)
+        panel.addView(slider("Tamanho da fonte", 8, maxTs, l.textSize.roundToInt(), " px") { v -> l.textSize = v.toFloat() })
+        panel.addView(slider("Espaço entre letras", -10, 50, (l.letterSp * 100).roundToInt(), "") { v -> l.letterSp = v / 100f })
+        panel.addView(slider("Altura da linha", 70, 200, (l.lineH * 100).roundToInt(), "%") { v -> l.lineH = v / 100f })
+
+        // Cor
+        panel.addView(section("COR DO TEXTO"))
+        panel.addView(swatches(l.textColor, false) { c -> pushUndo(); l.textColor = c; commit() })
+
+        // Contorno
+        panel.addView(section("CONTORNO"))
+        panel.addView(slider("Espessura do contorno", 0, 40, l.outline.roundToInt(), " px") { v -> l.outline = v.toFloat() })
+        panel.addView(swatches(l.outlineColor, false) { c -> pushUndo(); l.outlineColor = c; if (l.outline == 0f) l.outline = 4f; commit() })
+
+        // Fundo
+        panel.addView(section("FUNDO DO TEXTO"))
+        panel.addView(swatches(l.textBg, true) { c ->
+            pushUndo()
+            val a = Color.alpha(l.textBg)
+            l.textBg = if (c == Color.TRANSPARENT) c else if (a in 1..254) (c and 0x00FFFFFF) or (a shl 24) else c
+            commit()
+        })
+        if (Color.alpha(l.textBg) > 0) {
+            panel.addView(slider("Opacidade do fundo", 5, 100, Color.alpha(l.textBg) * 100 / 255, "%") { v ->
+                l.textBg = (l.textBg and 0x00FFFFFF) or ((v * 255 / 100) shl 24)
+            })
+        }
+        panel.addView(slider("Margem interna", 0, 120, l.textPad.roundToInt(), " px") { v -> l.textPad = v.toFloat() })
+        panel.addView(radiusSlider(l, "Cantos do fundo"))
+
+        // Sombra
+        panel.addView(section("SOMBRA"))
+        panel.addView(slider("Desfoque", 0, 60, l.shBlur.roundToInt(), " px") { v -> l.shBlur = v.toFloat() })
+        panel.addView(slider("Distância", 0, 60, l.shDist.roundToInt(), " px") { v -> l.shDist = v.toFloat() })
+        panel.addView(slider("Força da sombra", 0, 100, Color.alpha(l.shColor) * 100 / 255, "%") { v ->
+            l.shColor = (l.shColor and 0x00FFFFFF) or ((v * 255 / 100) shl 24)
+        })
+        panel.addView(tv("Cor da sombra", 12f, C_DIM))
+        panel.addView(swatches(l.shColor or 0xFF000000.toInt(), false) { c ->
+            pushUndo()
+            var a = Color.alpha(l.shColor)
+            if (a == 0) a = 180
+            l.shColor = (c and 0x00FFFFFF) or (a shl 24)
+            if (l.shBlur == 0f && l.shDist == 0f) { l.shBlur = 8f; l.shDist = 4f }
+            commit()
+        })
+        panel.addView(hrow(btn("Sem sombra") { pushUndo(); l.shBlur = 0f; l.shDist = 0f; commit() }))
+
+        // Opacidade
+        panel.addView(section("OPACIDADE"))
+        panel.addView(slider("Opacidade do texto", 0, 100, l.opacity, "%") { v -> l.opacity = v })
+    }
+
+    // ------------------------ Cor personalizada ----------------------
+    private fun colorPicker(initial: Int, onPick: (Int) -> Unit) {
+        val hsv = FloatArray(3)
+        Color.colorToHSV(if (Color.alpha(initial) == 0) Color.WHITE else initial, hsv)
+        var cur = Color.HSVToColor(hsv)
+        val box = vbox()
+        box.setPadding(dp(18), dp(8), dp(18), dp(4))
+        val preview = View(this)
+        preview.background = rounded(cur, 8, 0x55FFFFFF, 1)
+        box.addView(preview, lp(MATCH, dp(48)))
+        val hex = EditText(this)
+        hex.setSingleLine()
+        hex.setTextColor(C_TEXT)
+        hex.setText(String.format(Locale.US, "#%06X", cur and 0xFFFFFF))
+        fun upd() {
+            cur = Color.HSVToColor(hsv)
+            preview.background = rounded(cur, 8, 0x55FFFFFF, 1)
+            hex.setText(String.format(Locale.US, "#%06X", cur and 0xFFFFFF))
+        }
+        box.addView(slider("Matiz", 0, 360, hsv[0].roundToInt(), "°", false) { v -> hsv[0] = v.toFloat(); upd() })
+        box.addView(slider("Saturação", 0, 100, (hsv[1] * 100).roundToInt(), "%", false) { v -> hsv[1] = v / 100f; upd() })
+        box.addView(slider("Brilho", 0, 100, (hsv[2] * 100).roundToInt(), "%", false) { v -> hsv[2] = v / 100f; upd() })
+        box.addView(labeled("Código (ex.: #FF5722)", hex))
+        val sc = ScrollView(this)
+        sc.addView(box)
+        AlertDialog.Builder(this).setTitle("🎨 Cor personalizada").setView(sc)
+            .setPositiveButton("OK") { _, _ ->
+                val c = try { Color.parseColor(hex.text.toString().trim()) } catch (e: Exception) { cur }
+                onPick(c or 0xFF000000.toInt())
+            }
+            .setNegativeButton("Cancelar", null).show()
+    }
+
+    // ======================= PAINEL: ALINHAMENTO =====================
+    private fun buildAlign() {
+        panel.addView(tv("Alinhamento", 15f, C_TEXT, true))
+        val snap = CheckBox(this)
+        snap.text = "Linhas automáticas"
+        snap.setTextColor(C_TEXT)
+        snap.isChecked = snapLines
+        snap.setOnCheckedChangeListener { _, c -> snapLines = c; savePrefs() }
+        panel.addView(snap)
+        panel.addView(tv("Enquanto você arrasta uma imagem ou texto, aparece uma linha rosa quando ele se alinha " +
+                "com outro item, com o centro ou com as bordas da tela, e o item gruda nessa posição.", 11f, C_DIM))
+
+        val grid = CheckBox(this)
+        grid.text = "Grade"
+        grid.setTextColor(C_TEXT)
+        grid.isChecked = gridOn
+        grid.setOnCheckedChangeListener { _, c -> gridOn = c; savePrefs(); canvasView.invalidate() }
+        val glp = lp(MATCH, WRAP, 0f, dp(10))
+        panel.addView(grid, glp)
+        panel.addView(slider("Colunas da grade", 2, 12, gridCols, "", false) { v -> gridCols = v; savePrefs() })
+        panel.addView(tv("As linhas da grade são calculadas para formar quadrados. A grade só aparece no editor, " +
+                "não vai para a imagem salva. Com as linhas automáticas ligadas, os itens também grudam na grade.", 11f, C_DIM))
+
+        panel.addView(section("ALINHAR ITEM SELECIONADO NA TELA"))
+        val l = selected()
+        when {
+            l == null -> panel.addView(tv("Selecione uma imagem, forma ou texto.", 12f, C_DIM))
+            l.locked -> panel.addView(tv("🔒 Camada bloqueada.", 12f, C_DIM))
+            else -> {
+                panel.addView(hrow(btn("⇤ Esquerda") { alignTo(l, 0) }, btn("↔ Centro") { alignTo(l, 1) }, btn("⇥ Direita") { alignTo(l, 2) }))
+                panel.addView(hrow(btn("⤒ Topo") { alignTo(l, 3) }, btn("↕ Meio") { alignTo(l, 4) }, btn("⤓ Base") { alignTo(l, 5) }))
+            }
+        }
+    }
+
+    private fun alignTo(l: Layer, m: Int) {
+        val d = doc ?: return
+        pushUndo()
+        val b = RectF()
+        layerBounds(l, b)
+        when (m) {
+            0 -> l.x -= b.left
+            1 -> l.x += d.w / 2f - b.centerX()
+            2 -> l.x += d.w - b.right
+            3 -> l.y -= b.top
+            4 -> l.y += d.h / 2f - b.centerY()
+            5 -> l.y += d.h - b.bottom
+        }
+        commit()
     }
 
     // ========================= PAINEL: ESTILOS =======================
